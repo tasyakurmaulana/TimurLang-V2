@@ -1,0 +1,1165 @@
+// ============================================================================
+// 💾 [KODINGAN DATABASE LOKAL - SQLITE (OFFLINE-FIRST)]
+// ----------------------------------------------------------------------------
+// File: database_service.dart
+// Penjelasan:
+// - Menggunakan package 'sqflite' & 'sqflite_common_ffi_web'
+// - Berfungsi sebagai penyimpanan basis data lokal (SQLite) pada perangkat
+// - Menyimpan tabel: users, medical_profiles, mountains, basecamp_posts,
+//   simaksi_permits, sos_incidents, sync_queue, personal_data, feedback
+// - Mendukung operasi CRUD lokal saat tidak ada koneksi internet (offline mode)
+// ============================================================================
+
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import 'package:sqflite_common_ffi_web/sqflite_ffi_web.dart';
+import '../config/constants.dart';
+import '../data/seed_data.dart';
+import '../models/user.dart';
+import '../models/medical_profile.dart';
+import '../models/mountain.dart';
+import '../models/basecamp_post.dart';
+import '../models/simaksi_permit.dart';
+import '../models/sos_incident.dart';
+import '../models/sync_queue.dart';
+import '../models/user_personal_data.dart';
+import '../models/course_feedback.dart';
+
+class DatabaseService {
+  static Database? _database;
+  static final DatabaseService instance = DatabaseService._internal();
+
+  DatabaseService._internal();
+
+  /// Inisialisasi database factory untuk platform web
+  /// Menggunakan databaseFactoryFfiWebNoWebWorker agar berjalan langsung di main thread
+  /// dan menghindari isu SharedWorker / postMessage null di berbagai browser
+  static void initForWeb() {
+    if (kIsWeb) {
+      databaseFactory = databaseFactoryFfiWebNoWebWorker;
+    }
+  }
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
+  }
+
+  Future<Database> _initDatabase() async {
+    final String path;
+    if (kIsWeb) {
+      path = AppConstants.dbName;
+    } else {
+      final dbPath = await getDatabasesPath();
+      path = join(dbPath, AppConstants.dbName);
+    }
+
+    final db = await openDatabase(
+      path,
+      version: AppConstants.dbVersion,
+      onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
+    );
+
+    // Pastikan kolom data_anggota tersedia di tabel simaksi_permits
+    try {
+      await db.execute('ALTER TABLE simaksi_permits ADD COLUMN data_anggota TEXT');
+    } catch (_) {}
+
+    // Pastikan kolom pengaturan basecamp (kuota, status jalur, harga simaksi) tersedia
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN status_jalur TEXT DEFAULT 'Buka'");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN kuota_harian INTEGER DEFAULT 100");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN sisa_kuota_hari_ini INTEGER DEFAULT 100");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN harga_simaksi REAL DEFAULT 15000.0");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN updated_at TEXT");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE basecamp_posts ADD COLUMN checkpoints_json TEXT");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE simaksi_permits ADD COLUMN nama_basecamp TEXT");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE simaksi_permits ADD COLUMN alasan_pembatalan TEXT");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE simaksi_permits ADD COLUMN opsi_pembatalan TEXT");
+    } catch (_) {}
+    try {
+      await db.execute("ALTER TABLE simaksi_permits ADD COLUMN rekening_refund TEXT");
+    } catch (_) {}
+
+    // Pastikan tabel user_personal_data tersedia
+    try {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS user_personal_data (
+          id TEXT PRIMARY KEY,
+          user_id TEXT UNIQUE NOT NULL,
+          kewarganegaraan TEXT NOT NULL,
+          jenis_identitas TEXT NOT NULL,
+          nomor_ktp TEXT NOT NULL,
+          file_ktp_url TEXT,
+          nama_lengkap TEXT NOT NULL,
+          nama_belakang TEXT,
+          tanggal_lahir TEXT NOT NULL,
+          jenis_kelamin TEXT NOT NULL,
+          no_telepon TEXT NOT NULL,
+          no_telepon_darurat TEXT NOT NULL,
+          surel TEXT NOT NULL,
+          berat_badan REAL,
+          tinggi_badan REAL,
+          provinsi TEXT NOT NULL,
+          kota_kabupaten TEXT NOT NULL,
+          kecamatan TEXT NOT NULL,
+          kelurahan TEXT NOT NULL,
+          alamat TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+      ''');
+    } catch (_) {}
+
+    // Pastikan seluruh data 50 gunung dan 122 basecamp terisi & ter-update
+    try {
+      final count = Sqflite.firstIntValue(
+        await db.rawQuery('SELECT COUNT(*) FROM mountains'),
+      ) ?? 0;
+      final bcCount = Sqflite.firstIntValue(
+        await db.rawQuery('SELECT COUNT(*) FROM basecamp_posts'),
+      ) ?? 0;
+      if (count < 50 || bcCount < 122) {
+        await _seedMountains(db);
+        await _seedBasecamps(db);
+        await _seedBasecampUsers(db);
+      } else {
+        // Selalu sinkronkan data master gunung dan basecamp agar nama pos dan koordinat selalu mutakhir
+        await _seedMountains(db);
+        await _seedBasecamps(db);
+      }
+    } catch (_) {}
+
+    // Backfill & pulihkan nama_basecamp serta basecamp_id yang hilang pada tiket SIMAKSI
+    try {
+      // 1. Pulihkan tiket Merbabu yang basecamp_id-nya null/hilang menjadi Selo Boyolali (bc-023)
+      await db.execute('''
+        UPDATE simaksi_permits
+        SET basecamp_id = 'bc-023',
+            nama_basecamp = 'Selo Boyolali'
+        WHERE (gunung_id = 'mtn-014' OR nama_gunung LIKE '%Merbabu%')
+          AND (basecamp_id IS NULL OR basecamp_id = '' OR nama_basecamp IS NULL OR nama_basecamp = '' OR nama_basecamp = 'Pos Basecamp Resmi');
+      ''');
+
+      // 2. Backfill nama_basecamp dari basecamp_posts untuk seluruh tiket yang sudah memiliki basecamp_id
+      await db.execute('''
+        UPDATE simaksi_permits
+        SET nama_basecamp = (
+          SELECT nama_pos FROM basecamp_posts WHERE basecamp_posts.id = simaksi_permits.basecamp_id
+        )
+        WHERE basecamp_id IS NOT NULL
+          AND (SELECT nama_pos FROM basecamp_posts WHERE basecamp_posts.id = simaksi_permits.basecamp_id) IS NOT NULL
+          AND (nama_basecamp IS NULL OR nama_basecamp = '' OR nama_basecamp = 'Pos Basecamp Resmi');
+      ''');
+    } catch (_) {}
+
+    return db;
+  }
+
+  // ==========================================================================
+  // [DATABASE LOKAL: STRUKTUR TABEL SQLITE (SCHEMA DDL)]
+  // Membuat tabel-tabel lokal saat database pertama kali dibuka
+  // ==========================================================================
+  Future<void> _onCreate(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        peran TEXT NOT NULL,
+        nama_lengkap TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        foto_profil_url TEXT,
+        is_biometric_enabled INTEGER DEFAULT 0,
+        biometric_token TEXT,
+        gunung_id TEXT,
+        nama_basecamp TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE user_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        session_token TEXT NOT NULL,
+        is_biometric_enabled INTEGER DEFAULT 0,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE medical_profiles (
+        id TEXT PRIMARY KEY,
+        user_id TEXT UNIQUE NOT NULL,
+        golongan_darah TEXT NOT NULL,
+        riwayat_penyakit TEXT NOT NULL,
+        alergi TEXT NOT NULL,
+        kontak_darurat_nama TEXT NOT NULL,
+        kontak_darurat_telepon TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE mountains (
+        id TEXT PRIMARY KEY,
+        nama_gunung TEXT NOT NULL,
+        elevasi_mdpl INTEGER NOT NULL,
+        tingkat_bahaya TEXT NOT NULL,
+        sumber_air_tersedia INTEGER NOT NULL,
+        status_jalur TEXT NOT NULL,
+        koordinat_lat REAL NOT NULL,
+        koordinat_long REAL NOT NULL,
+        deskripsi TEXT,
+        foto_url TEXT,
+        kuota_harian INTEGER,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE basecamp_posts (
+        id TEXT PRIMARY KEY,
+        gunung_id TEXT NOT NULL,
+        user_id_petugas TEXT,
+        nama_pos TEXT NOT NULL,
+        lokasi_deskripsi TEXT NOT NULL,
+        kontak_pos TEXT,
+        status_jalur TEXT DEFAULT 'Buka',
+        kuota_harian INTEGER DEFAULT 100,
+        sisa_kuota_hari_ini INTEGER DEFAULT 100,
+        harga_simaksi REAL DEFAULT 15000.0,
+        checkpoints_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        FOREIGN KEY (gunung_id) REFERENCES mountains(id),
+        FOREIGN KEY (user_id_petugas) REFERENCES users(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE simaksi_permits (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        gunung_id TEXT NOT NULL,
+        basecamp_id TEXT,
+        nama_basecamp TEXT,
+        tanggal_naik TEXT NOT NULL,
+        tanggal_turun TEXT NOT NULL,
+        jumlah_anggota INTEGER NOT NULL,
+        status_izin TEXT NOT NULL,
+        block_hash TEXT NOT NULL,
+        previous_hash TEXT NOT NULL,
+        nonce INTEGER NOT NULL,
+        nama_gunung TEXT,
+        total_biaya REAL,
+        matauang TEXT,
+        data_anggota TEXT,
+        alasan_pembatalan TEXT,
+        opsi_pembatalan TEXT,
+        rekening_refund TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (gunung_id) REFERENCES mountains(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE sos_incident_logs (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        gunung_id TEXT,
+        basecamp_id TEXT,
+        koordinat_lat REAL NOT NULL,
+        koordinat_long REAL NOT NULL,
+        tipe_pemicu TEXT NOT NULL,
+        status_penanganan TEXT NOT NULL,
+        waktu_kejadian TEXT NOT NULL,
+        nama_pendaki TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE sync_queues (
+        id TEXT PRIMARY KEY,
+        nama_tabel TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        aksi_tipe TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status_sinkronisasi TEXT NOT NULL,
+        synced_at TEXT,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE course_feedbacks (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        nama_pengguna TEXT NOT NULL,
+        kesan_pesan TEXT NOT NULL,
+        rating INTEGER,
+        submitted_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      )
+    ''');
+
+    // Seed data gunung, basecamp, dan akun basecamp
+    await _seedMountains(db);
+    await _seedBasecamps(db);
+    await _seedBasecampUsers(db);
+  }
+
+  /// Migrasi database saat versi naik
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Tambah kolom is_biometric_enabled ke tabel users
+      await db.execute(
+        'ALTER TABLE users ADD COLUMN is_biometric_enabled INTEGER DEFAULT 0',
+      );
+    }
+    if (oldVersion < 3) {
+      // Tambah kolom biometric_token ke tabel users
+      await db.execute(
+        'ALTER TABLE users ADD COLUMN biometric_token TEXT',
+      );
+    }
+    if (oldVersion < 4) {
+      // Tambah kolom gunung_id dan nama_basecamp ke users, serta basecamp_id ke sos_incident_logs
+      try {
+        await db.execute('ALTER TABLE users ADD COLUMN gunung_id TEXT');
+      } catch (_) {}
+      try {
+        await db.execute('ALTER TABLE users ADD COLUMN nama_basecamp TEXT');
+      } catch (_) {}
+      try {
+        await db.execute('ALTER TABLE sos_incident_logs ADD COLUMN basecamp_id TEXT');
+      } catch (_) {}
+    }
+    if (oldVersion < 5) {
+      // Hapus data lama sesuai instruksi pengguna:
+      // kosongkan data gunung, basecamp, riwayat simaksi, dan akun basecamp
+      try {
+        await db.delete('simaksi_permits');
+        await db.delete('basecamp_posts');
+        await db.delete('mountains');
+        await db.delete('users', where: 'peran = ?', whereArgs: ['basecamp']);
+      } catch (_) {}
+
+      // Masukkan 50 gunung, 122 basecamp, dan 122 akun pengelola basecamp
+      await _seedMountains(db);
+      await _seedBasecamps(db);
+      await _seedBasecampUsers(db);
+    }
+    if (oldVersion < 6) {
+      try {
+        await db.execute('ALTER TABLE simaksi_permits ADD COLUMN data_anggota TEXT');
+      } catch (_) {}
+    }
+    if (oldVersion < 7) {
+      await _seedMountains(db);
+      await _seedBasecamps(db);
+      await _seedBasecampUsers(db);
+    }
+  }
+
+  Future<void> _seedMountains(Database db) async {
+    final batch = db.batch();
+    for (final m in SeedData.initialMountains) {
+      batch.insert('mountains', m, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<void> _seedBasecamps(Database db) async {
+    final batch = db.batch();
+    for (final bc in SeedData.initialBasecampPosts) {
+      batch.insert('basecamp_posts', bc, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<void> _seedBasecampUsers(Database db) async {
+    final batch = db.batch();
+    for (final u in SeedData.initialBasecampUsers) {
+      batch.insert('users', u, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// Reset total data gunung, basecamp, riwayat simaksi, dan isi ulang 122 basecamp & 50 gunung
+  Future<void> resetAndSeedBasecampData() async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('simaksi_permits');
+      await txn.delete('basecamp_posts');
+      await txn.delete('mountains');
+      await txn.delete('users', where: 'peran = ?', whereArgs: ['basecamp']);
+
+      for (final m in SeedData.initialMountains) {
+        await txn.insert('mountains', m, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      for (final bc in SeedData.initialBasecampPosts) {
+        await txn.insert('basecamp_posts', bc, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      for (final u in SeedData.initialBasecampUsers) {
+        await txn.insert('users', u, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  // ── USER CRUD ──
+
+  Future<void> insertUser(User user) async {
+    final db = await database;
+    await db.insert('users', user.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<User>> getAllUsers() async {
+    final db = await database;
+    final maps = await db.query('users');
+    return maps.map((m) => User.fromMap(m)).toList();
+  }
+
+  Future<User?> getUserByEmail(String email) async {
+    final db = await database;
+    final maps = await db.query('users', where: 'email = ?', whereArgs: [email]);
+    if (maps.isEmpty) return null;
+    return User.fromMap(maps.first);
+  }
+
+  Future<User?> getUserById(String id) async {
+    final db = await database;
+    final maps = await db.query('users', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return User.fromMap(maps.first);
+  }
+
+  Future<void> updateUser(User user) async {
+    final db = await database;
+    await db.update('users', user.toMap(), where: 'id = ?', whereArgs: [user.id]);
+  }
+
+  /// Update status biometrik user beserta token biometriknya
+  Future<void> updateBiometricStatus(String userId, bool enabled, {String? token}) async {
+    final db = await database;
+    await db.update(
+      'users',
+      {
+        'is_biometric_enabled': enabled ? 1 : 0,
+        'biometric_token': enabled ? token : null,
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id = ?',
+      whereArgs: [userId],
+    );
+  }
+
+  /// Ambil semua user yang telah mengaktifkan sidik jari di perangkat ini
+  Future<List<User>> getBiometricUsers() async {
+    final db = await database;
+    final maps = await db.query(
+      'users',
+      where: 'is_biometric_enabled = 1',
+      orderBy: 'updated_at DESC, created_at DESC',
+    );
+    return maps.map((m) => User.fromMap(m)).toList();
+  }
+
+  /// Ambil user terakhir yang mengaktifkan sidik jari
+  Future<User?> getLastBiometricUser() async {
+    final db = await database;
+    final maps = await db.query(
+      'users',
+      where: 'is_biometric_enabled = 1',
+      orderBy: 'updated_at DESC, created_at DESC',
+      limit: 1,
+    );
+    if (maps.isEmpty) return null;
+    return User.fromMap(maps.first);
+  }
+
+  // ── MEDICAL PROFILE CRUD ──
+
+  Future<void> insertMedicalProfile(MedicalProfile profile) async {
+    final db = await database;
+    await db.insert('medical_profiles', profile.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<MedicalProfile?> getMedicalProfile(String userId) async {
+    final db = await database;
+    final maps = await db.query('medical_profiles', where: 'user_id = ?', whereArgs: [userId]);
+    if (maps.isEmpty) return null;
+    return MedicalProfile.fromMap(maps.first);
+  }
+
+  Future<void> updateMedicalProfile(MedicalProfile profile) async {
+    final db = await database;
+    await db.update('medical_profiles', profile.toMap(), where: 'id = ?', whereArgs: [profile.id]);
+  }
+
+  // ── USER PERSONAL DATA CRUD (Syarat SIMAKSI) ──
+
+  Future<void> insertPersonalData(UserPersonalData data) async {
+    final db = await database;
+    await db.insert('user_personal_data', data.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<UserPersonalData?> getPersonalData(String userId) async {
+    final db = await database;
+    final maps = await db.query('user_personal_data', where: 'user_id = ?', whereArgs: [userId]);
+    if (maps.isEmpty) return null;
+    return UserPersonalData.fromMap(maps.first);
+  }
+
+  Future<void> updatePersonalData(UserPersonalData data) async {
+    final db = await database;
+    await db.update('user_personal_data', data.toMap(), where: 'id = ?', whereArgs: [data.id]);
+  }
+
+  Future<List<UserPersonalData>> getAllPersonalData() async {
+    final db = await database;
+    final maps = await db.query('user_personal_data');
+    return maps.map((m) => UserPersonalData.fromMap(m)).toList();
+  }
+
+  // ── MOUNTAIN CRUD ──
+
+  Future<List<Mountain>> getAllMountains() async {
+    final db = await database;
+    final maps = await db.query('mountains', orderBy: 'nama_gunung ASC');
+    return maps.map((m) => Mountain.fromMap(m)).toList();
+  }
+
+  Future<List<Mountain>> filterMountains({
+    int? minElevasi,
+    int? maxElevasi,
+    String? tingkatBahaya,
+    bool? sumberAir,
+  }) async {
+    final db = await database;
+    final where = <String>[];
+    final args = <dynamic>[];
+
+    if (minElevasi != null) {
+      where.add('elevasi_mdpl >= ?');
+      args.add(minElevasi);
+    }
+    if (maxElevasi != null) {
+      where.add('elevasi_mdpl <= ?');
+      args.add(maxElevasi);
+    }
+    if (tingkatBahaya != null) {
+      where.add('tingkat_bahaya = ?');
+      args.add(tingkatBahaya);
+    }
+    if (sumberAir != null) {
+      where.add('sumber_air_tersedia = ?');
+      args.add(sumberAir ? 1 : 0);
+    }
+
+    final maps = await db.query(
+      'mountains',
+      where: where.isEmpty ? null : where.join(' AND '),
+      whereArgs: args.isEmpty ? null : args,
+      orderBy: 'elevasi_mdpl DESC',
+    );
+    return maps.map((m) => Mountain.fromMap(m)).toList();
+  }
+
+  Future<Mountain?> getMountainById(String id) async {
+    final db = await database;
+    final maps = await db.query('mountains', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return Mountain.fromMap(maps.first);
+  }
+
+  Future<void> updateMountainStatus(String id, String status) async {
+    final db = await database;
+    await db.update('mountains', {'status_jalur': status}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  // ── BASECAMP CRUD ──
+
+  Future<void> insertBasecampPost(BasecampPost post) async {
+    final db = await database;
+    await db.insert('basecamp_posts', post.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<BasecampPost>> getAllBasecampPosts() async {
+    final db = await database;
+    final maps = await db.query('basecamp_posts');
+    return maps.map((m) => BasecampPost.fromMap(m)).toList();
+  }
+
+  Future<List<BasecampPost>> getBasecampsByMountain(String gunungId) async {
+    final db = await database;
+    final maps = await db.query('basecamp_posts', where: 'gunung_id = ?', whereArgs: [gunungId]);
+    return maps.map((m) => BasecampPost.fromMap(m)).toList();
+  }
+
+  /// Mengambil semua basecamp resmi untuk gunung tertentu (diprioritaskan yang memiliki akun petugas)
+  Future<List<BasecampPost>> getRegisteredBasecampsByMountain(String gunungId) async {
+    final db = await database;
+    final maps = await db.query(
+      'basecamp_posts',
+      where: 'gunung_id = ?',
+      whereArgs: [gunungId],
+      orderBy: 'CASE WHEN user_id_petugas IS NOT NULL THEN 0 ELSE 1 END, nama_pos ASC',
+    );
+    return maps.map((m) => BasecampPost.fromMap(m)).toList();
+  }
+
+  /// Mengambil profil basecamp post milik petugas yang sedang login
+  Future<BasecampPost?> getBasecampByUserId(String userId) async {
+    final db = await database;
+    final maps = await db.query(
+      'basecamp_posts',
+      where: 'user_id_petugas = ?',
+      whereArgs: [userId],
+      limit: 1,
+    );
+    if (maps.isEmpty) return null;
+    return BasecampPost.fromMap(maps.first);
+  }
+
+  /// Memastikan akun petugas basecamp selalu memiliki data BasecampPost yang valid di SQLite.
+  /// Jika belum ada yang terhubung dengan userId, coba hubungkan berdasarkan nama pos / gunungId,
+  /// atau buatkan entri BasecampPost baru secara otomatis sehingga tidak pernah kosong.
+  Future<BasecampPost> ensureBasecampPostForUser(User user) async {
+    final db = await database;
+
+    // 1. Cek langsung berdasarkan user_id_petugas
+    final directMaps = await db.query(
+      'basecamp_posts',
+      where: 'user_id_petugas = ?',
+      whereArgs: [user.id],
+      limit: 1,
+    );
+    if (directMaps.isNotEmpty) {
+      return BasecampPost.fromMap(directMaps.first);
+    }
+
+    final gunungId = user.gunungId ?? 'mtn-001';
+    final namaPos = user.namaBasecamp?.trim();
+
+    // 2. Cek berdasarkan nama pos di gunung yang sama (jika ada)
+    if (namaPos != null && namaPos.isNotEmpty) {
+      final nameMaps = await db.query(
+        'basecamp_posts',
+        where: 'gunung_id = ? AND LOWER(nama_pos) = LOWER(?)',
+        whereArgs: [gunungId, namaPos],
+        limit: 1,
+      );
+      if (nameMaps.isNotEmpty) {
+        final post = BasecampPost.fromMap(nameMaps.first);
+        final updatedPost = post.copyWith(userIdPetugas: user.id);
+        await insertBasecampPost(updatedPost);
+        return updatedPost;
+      }
+    }
+
+    // 3. Cek apakah ada basecamp post di gunung ini
+    final mtnMaps = await db.query(
+      'basecamp_posts',
+      where: 'gunung_id = ?',
+      whereArgs: [gunungId],
+      limit: 1,
+    );
+    if (mtnMaps.isNotEmpty) {
+      final post = BasecampPost.fromMap(mtnMaps.first);
+      if (namaPos == null || namaPos.isEmpty || post.namaPos.toLowerCase().contains(namaPos.toLowerCase())) {
+        final updatedPost = post.copyWith(
+          userIdPetugas: user.id,
+          namaPos: (namaPos != null && namaPos.isNotEmpty) ? namaPos : post.namaPos,
+        );
+        await insertBasecampPost(updatedPost);
+        return updatedPost;
+      }
+    }
+
+    // 4. Jika benar-benar belum ada, buatkan data BasecampPost baru
+    final safeSub = user.id.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '');
+    final safeId = 'bc-${safeSub.length >= 8 ? safeSub.substring(0, 8) : safeSub.padRight(8, '0')}';
+    final newPost = BasecampPost(
+      id: safeId,
+      gunungId: gunungId,
+      userIdPetugas: user.id,
+      namaPos: (namaPos != null && namaPos.isNotEmpty)
+          ? namaPos
+          : (user.namaLengkap.trim().isNotEmpty ? 'Basecamp ${user.namaLengkap}' : 'Pos Basecamp'),
+      lokasiDeskripsi: 'Basecamp Resmi Jalur Pendakian',
+      kontakPos: user.email,
+      statusJalur: 'Buka',
+      kuotaHarian: 100,
+      sisaKuotaHariIni: 100,
+      hargaSimaksi: 15000.0,
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+    );
+    await insertBasecampPost(newPost);
+    return newPost;
+  }
+
+  Future<BasecampPost?> getBasecampById(String id) async {
+    final db = await database;
+    final maps = await db.query('basecamp_posts', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return BasecampPost.fromMap(maps.first);
+  }
+
+  /// Update pengaturan operasional basecamp (status jalur, kuota harian, sisa kuota, tarif SIMAKSI)
+  Future<void> updateBasecampSettings({
+    required String basecampId,
+    required String statusJalur,
+    required int kuotaHarian,
+    required int sisaKuotaHariIni,
+    required double hargaSimaksi,
+  }) async {
+    final db = await database;
+    await db.update(
+      'basecamp_posts',
+      {
+        'status_jalur': statusJalur,
+        'kuota_harian': kuotaHarian,
+        'sisa_kuota_hari_ini': sisaKuotaHariIni,
+        'harga_simaksi': hargaSimaksi,
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id = ?',
+      whereArgs: [basecampId],
+    );
+  }
+
+  /// Update titik pos jalur pendakian (checkpoints) milik basecamp
+  Future<void> updateBasecampCheckpoints(String basecampId, String checkpointsJson) async {
+    final db = await database;
+    await db.update(
+      'basecamp_posts',
+      {
+        'checkpoints_json': checkpointsJson,
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id = ?',
+      whereArgs: [basecampId],
+    );
+  }
+
+  /// Kurangi sisa kuota basecamp secara realtime saat ada pendaki check-in / masuk jalur
+  Future<void> reduceBasecampQuota(String basecampId, int jumlahOrang) async {
+    final db = await database;
+    final bc = await getBasecampById(basecampId);
+    if (bc != null) {
+      final int newSisa = (bc.sisaKuotaHariIni - jumlahOrang).clamp(0, bc.kuotaHarian);
+      await db.update(
+        'basecamp_posts',
+        {
+          'sisa_kuota_hari_ini': newSisa,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [basecampId],
+      );
+    }
+  }
+
+  /// Tambah kembali sisa kuota basecamp secara realtime saat ada pembatalan tiket
+  Future<void> increaseBasecampQuota(String basecampId, int jumlahOrang) async {
+    final db = await database;
+    final bc = await getBasecampById(basecampId);
+    if (bc != null) {
+      final int newSisa = (bc.sisaKuotaHariIni + jumlahOrang).clamp(0, bc.kuotaHarian);
+      await db.update(
+        'basecamp_posts',
+        {
+          'sisa_kuota_hari_ini': newSisa,
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [basecampId],
+      );
+    }
+  }
+
+  /// Hitung total pendaki aktif di jalur untuk basecamp ini (dihitung per orang / sum jumlah_anggota)
+  Future<int> getActiveHikersCountForBasecamp({
+    required String gunungId,
+    String? basecampId,
+  }) async {
+    final permits = await getActivePermitsForBasecamp(
+      gunungId: gunungId,
+      basecampId: basecampId,
+    );
+    return permits.fold<int>(0, (sum, p) => sum + p.jumlahAnggota);
+  }
+
+  // ── SIMAKSI PERMIT CRUD ──
+
+  Future<void> insertPermit(SimaksiPermit permit) async {
+    final db = await database;
+    final existing = await db.query(
+      'simaksi_permits',
+      where: 'id = ?',
+      whereArgs: [permit.id],
+      limit: 1,
+    );
+    if (existing.isNotEmpty) {
+      final old = existing.first;
+      // Jangan timpa nilai field lokal jika data incoming null/kosong tapi data lama ada
+      final mergedPermit = permit.copyWith(
+        basecampId: (permit.basecampId != null && permit.basecampId!.isNotEmpty)
+            ? permit.basecampId
+            : old['basecamp_id'] as String?,
+        namaBasecamp: (permit.namaBasecamp != null &&
+                permit.namaBasecamp!.isNotEmpty &&
+                permit.namaBasecamp != 'Pos Basecamp Resmi')
+            ? permit.namaBasecamp
+            : (old['nama_basecamp'] != null &&
+                    (old['nama_basecamp'] as String).isNotEmpty &&
+                    old['nama_basecamp'] != 'Pos Basecamp Resmi')
+                ? old['nama_basecamp'] as String?
+                : null,
+        namaGunung: (permit.namaGunung != null && permit.namaGunung!.isNotEmpty)
+            ? permit.namaGunung
+            : old['nama_gunung'] as String?,
+        dataAnggota: (permit.dataAnggota != null && permit.dataAnggota!.isNotEmpty)
+            ? permit.dataAnggota
+            : old['data_anggota'] as String?,
+      );
+      await db.insert('simaksi_permits', mergedPermit.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+      return;
+    }
+    await db.insert('simaksi_permits', permit.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<SimaksiPermit>> getAllPermits() async {
+    final db = await database;
+    final maps = await db.query('simaksi_permits');
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  Future<List<SimaksiPermit>> getPermitsByUser(String userId) async {
+    final db = await database;
+    final maps = await db.rawQuery('''
+      SELECT p.*,
+             b.nama_pos AS b_nama_pos,
+             CASE
+               WHEN p.nama_basecamp IS NOT NULL 
+                    AND p.nama_basecamp != '' 
+                    AND p.nama_basecamp != 'Pos Basecamp Resmi'
+                 THEN p.nama_basecamp
+               WHEN b.nama_pos IS NOT NULL AND b.nama_pos != ''
+                 THEN b.nama_pos
+               ELSE p.nama_basecamp
+             END AS resolved_nama_basecamp
+      FROM simaksi_permits p
+      LEFT JOIN basecamp_posts b ON p.basecamp_id = b.id
+      WHERE p.user_id = ?
+      ORDER BY p.created_at DESC
+    ''', [userId]);
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  /// Mengambil tiket SIMAKSI aktif yang sedang 'Di Jalur' dari seorang pendaki
+  Future<SimaksiPermit?> getActivePermitForHiker(String userId) async {
+    final db = await database;
+    final maps = await db.rawQuery('''
+      SELECT p.*,
+             b.nama_pos AS b_nama_pos,
+             CASE
+               WHEN p.nama_basecamp IS NOT NULL 
+                    AND p.nama_basecamp != '' 
+                    AND p.nama_basecamp != 'Pos Basecamp Resmi'
+                 THEN p.nama_basecamp
+               WHEN b.nama_pos IS NOT NULL AND b.nama_pos != ''
+                 THEN b.nama_pos
+               ELSE p.nama_basecamp
+             END AS resolved_nama_basecamp
+      FROM simaksi_permits p
+      LEFT JOIN basecamp_posts b ON p.basecamp_id = b.id
+      WHERE p.user_id = ? AND p.status_izin = ?
+      ORDER BY p.created_at DESC
+      LIMIT 1
+    ''', [userId, AppConstants.statusDiJalur]);
+    if (maps.isNotEmpty) {
+      return SimaksiPermit.fromMap(maps.first);
+    }
+    // Fallback cek status tervalidasi atau terdaftar jika belum check-in
+    final fallback = await db.rawQuery('''
+      SELECT p.*,
+             b.nama_pos AS b_nama_pos,
+             CASE
+               WHEN p.nama_basecamp IS NOT NULL 
+                    AND p.nama_basecamp != '' 
+                    AND p.nama_basecamp != 'Pos Basecamp Resmi'
+                 THEN p.nama_basecamp
+               WHEN b.nama_pos IS NOT NULL AND b.nama_pos != ''
+                 THEN b.nama_pos
+               ELSE p.nama_basecamp
+             END AS resolved_nama_basecamp
+      FROM simaksi_permits p
+      LEFT JOIN basecamp_posts b ON p.basecamp_id = b.id
+      WHERE p.user_id = ? AND p.status_izin IN (?, ?)
+      ORDER BY p.created_at DESC
+      LIMIT 1
+    ''', [userId, AppConstants.statusTervalidasi, AppConstants.statusTerdaftar]);
+    if (fallback.isNotEmpty) {
+      return SimaksiPermit.fromMap(fallback.first);
+    }
+    return null;
+  }
+
+  Future<SimaksiPermit?> getPermitByHash(String blockHash) async {
+    final db = await database;
+    final clean = blockHash.trim();
+    // 1. Cari berdasarkan block_hash (case-insensitive & trim)
+    var maps = await db.query(
+      'simaksi_permits',
+      where: 'LOWER(TRIM(block_hash)) = LOWER(?)',
+      whereArgs: [clean],
+    );
+    if (maps.isNotEmpty) return SimaksiPermit.fromMap(maps.first);
+
+    // 2. Fallback: Cari berdasarkan id tiket (jika barcode membaca ID permit)
+    maps = await db.query(
+      'simaksi_permits',
+      where: 'id = ?',
+      whereArgs: [clean],
+    );
+    if (maps.isNotEmpty) return SimaksiPermit.fromMap(maps.first);
+
+    return null;
+  }
+
+  Future<List<SimaksiPermit>> getActivePermits() async {
+    final db = await database;
+    final maps = await db.query(
+      'simaksi_permits',
+      where: 'status_izin IN (?, ?, ?)',
+      whereArgs: [AppConstants.statusTerdaftar, AppConstants.statusTervalidasi, AppConstants.statusDiJalur],
+      orderBy: 'created_at DESC',
+    );
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  /// Mengambil izin pendaki aktif khusus untuk akun basecamp tertentu
+  Future<List<SimaksiPermit>> getActivePermitsForBasecamp({
+    required String gunungId,
+    String? basecampId,
+  }) async {
+    final db = await database;
+    String whereClause = 'gunung_id = ? AND status_izin = ?';
+    List<dynamic> whereArgs = [gunungId, AppConstants.statusDiJalur];
+
+    if (basecampId != null && basecampId.isNotEmpty) {
+      whereClause = 'gunung_id = ? AND (basecamp_id = ? OR basecamp_id IS NULL) AND status_izin = ?';
+      whereArgs = [gunungId, basecampId, AppConstants.statusDiJalur];
+    }
+
+    final maps = await db.query(
+      'simaksi_permits',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'created_at DESC',
+    );
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  /// Mengambil semua izin/tiket SIMAKSI (termasuk Terdaftar, Batal, Refund, dll) khusus untuk basecamp ini
+  Future<List<SimaksiPermit>> getAllPermitsForBasecamp({
+    required String gunungId,
+    String? basecampId,
+  }) async {
+    final db = await database;
+    String whereClause = 'gunung_id = ?';
+    List<dynamic> whereArgs = [gunungId];
+
+    if (basecampId != null && basecampId.isNotEmpty) {
+      whereClause = 'gunung_id = ? AND (basecamp_id = ? OR basecamp_id IS NULL)';
+      whereArgs = [gunungId, basecampId];
+    }
+
+    final maps = await db.query(
+      'simaksi_permits',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'created_at DESC',
+    );
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  Future<List<SimaksiPermit>> getPermitsByMountain(String gunungId) async {
+    final db = await database;
+    final maps = await db.query(
+      'simaksi_permits',
+      where: 'gunung_id = ? AND status_izin IN (?, ?)',
+      whereArgs: [gunungId, AppConstants.statusTervalidasi, AppConstants.statusDiJalur],
+      orderBy: 'created_at DESC',
+    );
+    return maps.map((m) => SimaksiPermit.fromMap(m)).toList();
+  }
+
+  Future<void> updatePermitStatus(String id, String status) async {
+    final db = await database;
+    await db.update('simaksi_permits', {'status_izin': status}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// Update data lengkap permit (status, alasan batal, opsi pembatalan, rekening refund, tanggal naik/turun)
+  Future<void> updatePermit(SimaksiPermit permit) async {
+    final db = await database;
+    await db.update(
+      'simaksi_permits',
+      permit.toMap(),
+      where: 'id = ?',
+      whereArgs: [permit.id],
+    );
+  }
+
+  Future<String> getLastPermitHash() async {
+    final db = await database;
+    final maps = await db.query('simaksi_permits', orderBy: 'created_at DESC', limit: 1);
+    if (maps.isEmpty) return 'GENESIS';
+    return maps.first['block_hash'] as String;
+  }
+
+  // ── SOS INCIDENT CRUD ──
+
+  Future<void> insertSosIncident(SosIncident incident) async {
+    final db = await database;
+    await db.insert('sos_incident_logs', incident.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<SosIncident>> getAllSosIncidents() async {
+    final db = await database;
+    final maps = await db.query('sos_incident_logs');
+    return maps.map((m) => SosIncident.fromMap(m)).toList();
+  }
+
+  Future<List<SosIncident>> getActiveSOSIncidents() async {
+    final db = await database;
+    final maps = await db.query(
+      'sos_incident_logs',
+      where: 'status_penanganan = ?',
+      whereArgs: [AppConstants.sosActive],
+      orderBy: 'waktu_kejadian DESC',
+    );
+    return maps.map((m) => SosIncident.fromMap(m)).toList();
+  }
+
+  /// Mengambil insiden SOS darurat aktif khusus untuk akun basecamp terkait
+  Future<List<SosIncident>> getActiveSOSIncidentsForBasecamp({
+    required String gunungId,
+    String? basecampId,
+  }) async {
+    final allActive = await getActiveSOSIncidents();
+    final List<SosIncident> matched = [];
+
+    for (final inc in allActive) {
+      // 1. Cek langsung dari gunung_id dan basecamp_id di SOS incident
+      if (inc.gunungId != null && inc.gunungId == gunungId) {
+        if (basecampId == null || inc.basecampId == null || inc.basecampId == basecampId) {
+          matched.add(inc);
+          continue;
+        }
+      }
+
+      // 2. Jika sinyal darurat belum memiliki gunungId (SOS umum / pendaki darurat tanpa tiket),
+      // pos basecamp siaga tetap harus menerima peringatan darurat ini
+      if (inc.gunungId == null) {
+        matched.add(inc);
+        continue;
+      }
+
+      // 3. Jika gunung_id belum tercatat di SOS, cek tiket SIMAKSI pendaki yang berstatus 'Di Jalur'
+      final permit = await getActivePermitForHiker(inc.userId);
+      if (permit != null && permit.gunungId == gunungId) {
+        if (basecampId == null || permit.basecampId == null || permit.basecampId == basecampId) {
+          matched.add(inc);
+        }
+      }
+    }
+
+    return matched;
+  }
+
+  Future<void> updateSOSStatus(String id, String status) async {
+    final db = await database;
+    await db.update('sos_incident_logs', {'status_penanganan': status}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  // ── SYNC QUEUE ──
+
+  Future<void> insertSyncQueue(SyncQueue queue) async {
+    final db = await database;
+    await db.insert('sync_queues', queue.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<SyncQueue>> getPendingSyncItems() async {
+    final db = await database;
+    final maps = await db.query(
+      'sync_queues',
+      where: 'status_sinkronisasi = ?',
+      whereArgs: [AppConstants.syncPending],
+      orderBy: 'created_at ASC',
+    );
+    return maps.map((m) => SyncQueue.fromMap(m)).toList();
+  }
+
+  Future<void> updateSyncStatus(String id, String status) async {
+    final db = await database;
+    await db.update(
+      'sync_queues',
+      {'status_sinkronisasi': status, 'synced_at': DateTime.now().toIso8601String()},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  // ── COURSE FEEDBACK ──
+
+  Future<void> insertFeedback(CourseFeedback feedback) async {
+    final db = await database;
+    await db.insert('course_feedbacks', feedback.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<CourseFeedback>> getAllFeedbacks() async {
+    final db = await database;
+    final maps = await db.query('course_feedbacks', orderBy: 'submitted_at DESC');
+    return maps.map((m) => CourseFeedback.fromMap(m)).toList();
+  }
+
+  Future<List<CourseFeedback>> getLatestFeedbacks({int limit = 5}) async {
+    final db = await database;
+    final maps = await db.query(
+      'course_feedbacks',
+      orderBy: 'submitted_at DESC',
+      limit: limit,
+    );
+    return maps.map((m) => CourseFeedback.fromMap(m)).toList();
+  }
+}
